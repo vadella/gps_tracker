@@ -1,0 +1,1 @@
+from .MyGPSFile import MyFitFileBase, MyFitFileTrack, MyFitFileTrackMap
