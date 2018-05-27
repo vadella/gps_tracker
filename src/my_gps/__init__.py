@@ -1,0 +1,1 @@
+from .GPS_file import myFitFile
