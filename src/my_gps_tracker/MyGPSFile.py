@@ -1,6 +1,7 @@
 import datetime
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 import pandas as pd
 from bokeh.layouts import Column
@@ -40,15 +41,16 @@ class MyFitFileBase:
 
         self._data = _parse_records(messages, time_dif)
         self._messages = messages
-        self._datasource = ColumnDataSource(self._data)
 
     @property
     def data(self) -> pd.DataFrame:
         return self._data.copy()
 
-    @property
-    def datasource(self):
-        return self._datasource
+    @lru_cache(None)
+    def data_between(self, interval):
+        interval = _parse_interval(interval)
+        interval = slice(*interval)
+        return self.data.loc[interval]
 
 
 class MyFitFileTrack(MyFitFileBase):
@@ -69,8 +71,6 @@ class MyFitFileTrack(MyFitFileBase):
 class BokehMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._data_resampled = self.data.resample('5s').agg(lambda x: x.mean())
-        self._datasource = ColumnDataSource(self._data_resampled)
 
         self._hovertool_settings = dict(
             tooltips=[
@@ -91,24 +91,30 @@ class BokehMixin:
             mode="vline",
         )
 
-        try:
-            coord_min = self.data[['lat_mercator', 'lon_mercator']].min()
-            coord_max = self.data[['lat_mercator', 'lon_mercator']].max()
-            self._coord_limits = tuple(zip(*(coord_min, coord_max)))
-        except KeyError:
-            self._coord_limits = None
-
-    def route_map(self, source='hikebike'):
-        if self._coord_limits is None:
-            return None
-
-        x_limit, y_limit = self._coord_limits
+    def route_map(self, *, source='hikebike', interval=None):
+        interval = _parse_interval(interval)
+        data = self.data_between(interval)
+        coord_min = data[['lat_mercator', 'lon_mercator']].min()
+        coord_max = data[['lat_mercator', 'lon_mercator']].max()
+        x_limit, y_limit = zip(*(coord_min, coord_max))
         tilesource = _get_tilesource(source)
-        p = figure(x_range=y_limit, y_range=x_limit,
-                   x_axis_type="mercator", y_axis_type="mercator")
+        p = figure(
+            x_range=y_limit,
+            y_range=x_limit,
+            x_axis_type="mercator",
+            y_axis_type="mercator",
+        )
         p.add_tools(self.hovertool(mode='mouse'))
         p.add_tile(tilesource)
-        p.scatter('lon_mercator', 'lat_mercator', source=self._datasource, hover_color="firebrick", size=1)
+
+        datasource = self.datasource(interval)
+        p.scatter(
+            'lon_mercator',
+            'lat_mercator',
+            source=datasource,
+            hover_color="firebrick",
+            size=1,
+        )
         return p
 
     def hovertool(self, **kwargs):
@@ -116,16 +122,29 @@ class BokehMixin:
         settings.update(kwargs)
         return HoverTool(**settings)
 
-    def plots(self, x_label='timestamp', subjects=('speed', 'cadence', 'heart_rate', 'altitude'), include_map=True):
+    @lru_cache(None)
+    def datasource(self, interval=None):
+        interval = _parse_interval(interval)
+        data = self.data_between(interval)
+        return ColumnDataSource(data)
 
+    def plots(
+            self,
+            x_label='timestamp_local',
+            subjects=('speed', 'cadence', 'heart_rate', 'altitude'),
+            include_map=True,
+            interval: tuple = None,
+    ):
+        interval = _parse_interval(interval)
         y_labels = {'speed': 'speed_km'}
-        source = self._datasource
+        datasource = self.datasource(interval=interval)
         x_axis_types = {
-            'timestamp': 'datetime'
+            'timestamp': 'datetime',
+            'timestamp_local': 'datetime',
         }
 
         x_range = None
-        plots = [self.route_map()] if (include_map and self._coord_limits) else []
+        plots = [self.route_map(interval=interval)] if include_map else []
         for subject in subjects:
             p = figure(
                 x_axis_type=x_axis_types.get(x_label, 'linear'),
@@ -133,11 +152,17 @@ class BokehMixin:
                 title=subject,
                 title_location="left",
                 plot_width=800,
-                plot_height=300
+                plot_height=300,
             )
             p.add_tools(self.hovertool())
             x_range = p.x_range if x_range is None else x_range
-            p.scatter(x_label, y_labels.get(subject, subject), source=source, hover_color="firebrick", size=1, )
+            p.scatter(
+                x_label,
+                y_labels.get(subject, subject),
+                source=datasource,
+                hover_color="firebrick",
+                size=1,
+            )
             plots.append(p)
         return Column(*plots)
 
@@ -183,7 +208,7 @@ def _parse_records(messages: dict, time_dif: datetime.timedelta = None) -> pd.Da
     records = [i.get_values() for i in messages['record']]
     df = pd.DataFrame.from_records(records)
     if time_dif:
-        df['timestamp'] = df['timestamp'] + time_dif
+        df['timestamp_local'] = df['timestamp'] + time_dif
     df['speed_km'] = df['speed'] * 3.6
     df['time_start'] = df['timestamp'] - df['timestamp'].iloc[0]
     return df.dropna(how='all', axis='columns').set_index('timestamp')
@@ -196,4 +221,13 @@ def _transform_coord(data: pd.DataFrame) -> pd.DataFrame:
     lat, lon = (data[label_lat] * factor).values, (data[label_lon] * factor).values
     #     lat_trans, lon_trans = transform(p2, p, lon, lat)
     lon_trans, lat_trans, = p(lon, lat)
-    return pd.DataFrame(data={'lat_mercator': lat_trans, 'lon_mercator': lon_trans}, index=data.index)
+    return pd.DataFrame(
+        data={'lat_mercator': lat_trans, 'lon_mercator': lon_trans},
+        index=data.index,
+    )
+
+
+def _parse_interval(interval):
+    if interval is None:
+        return None, None
+    return interval
